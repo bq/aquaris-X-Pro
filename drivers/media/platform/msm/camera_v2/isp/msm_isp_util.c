@@ -865,6 +865,7 @@ static long msm_isp_ioctl_unlocked(struct v4l2_subdev *sd,
 		break;
 	case VIDIOC_MSM_ISP_AXI_HALT:
 		mutex_lock(&vfe_dev->core_mutex);
+        trace_printk("%s: VFE%d AXI_HALT \n", __func__, vfe_dev->pdev->id);
 		rc = msm_isp_axi_halt(vfe_dev, arg);
 		mutex_unlock(&vfe_dev->core_mutex);
 		break;
@@ -873,11 +874,12 @@ static long msm_isp_ioctl_unlocked(struct v4l2_subdev *sd,
 		if (atomic_read(&vfe_dev->error_info.overflow_state)
 			!= HALT_ENFORCED) {
 			rc = msm_isp_stats_reset(vfe_dev);
+            trace_printk("%s: VFE%d AXI_RESET \n", __func__, vfe_dev->pdev->id);
 			rc2 = msm_isp_axi_reset(vfe_dev, arg);
 			if (!rc && rc2)
 				rc = rc2;
 		} else {
-			pr_err_ratelimited("%s: no HW reset, halt enforced.\n",
+			trace_printk("%s: no HW reset, halt enforced.\n",
 				__func__);
 		}
 		mutex_unlock(&vfe_dev->core_mutex);
@@ -886,12 +888,13 @@ static long msm_isp_ioctl_unlocked(struct v4l2_subdev *sd,
 		mutex_lock(&vfe_dev->core_mutex);
 		if (atomic_read(&vfe_dev->error_info.overflow_state)
 			!= HALT_ENFORCED) {
+            trace_printk("%s: VFE%d AXI_RESTART \n", __func__, vfe_dev->pdev->id);
 			rc = msm_isp_stats_restart(vfe_dev);
 			rc2 = msm_isp_axi_restart(vfe_dev, arg);
 			if (!rc && rc2)
 				rc = rc2;
 		} else {
-			pr_err_ratelimited("%s: no AXI restart, halt enforced.\n",
+			trace_printk("%s: no AXI restart, halt enforced.\n",
 				__func__);
 		}
 		mutex_unlock(&vfe_dev->core_mutex);
@@ -929,6 +932,7 @@ static long msm_isp_ioctl_unlocked(struct v4l2_subdev *sd,
 		mutex_unlock(&vfe_dev->core_mutex);
 		break;
 	case VIDIOC_MSM_ISP_REG_UPDATE_CMD:
+        trace_printk("reg_update received \n");
 		if (arg) {
 			enum msm_vfe_input_src frame_src =
 				*((enum msm_vfe_input_src *)arg);
@@ -1744,11 +1748,38 @@ void msm_isp_update_error_frame_count(struct vfe_device *vfe_dev)
 static int msm_isp_process_iommu_page_fault(struct vfe_device *vfe_dev)
 {
 	int rc = vfe_dev->buf_mgr->pagefault_debug_disable;
+    uint32_t irq_status0, irq_status1;
+    uint32_t overflow_mask;
+    unsigned long irq_flags;
 
-	pr_err("%s:%d] VFE%d Handle Page fault! vfe_dev %pK\n", __func__,
-		__LINE__,  vfe_dev->pdev->id, vfe_dev);
-
-	msm_isp_halt_send_error(vfe_dev, ISP_EVENT_IOMMU_P_FAULT);
+       /* Check if any overflow bit is set */
+       vfe_dev->hw_info->vfe_ops.core_ops.
+               get_overflow_mask(&overflow_mask);
+       vfe_dev->hw_info->vfe_ops.irq_ops.
+               read_irq_status(vfe_dev, &irq_status0, &irq_status1);
+       overflow_mask &= irq_status1;
+       spin_lock_irqsave(
+               &vfe_dev->common_data->common_dev_data_lock, irq_flags);
+       if (overflow_mask ||
+               atomic_read(&vfe_dev->error_info.overflow_state) !=
+                       NO_OVERFLOW) {
+               spin_unlock_irqrestore(
+                       &vfe_dev->common_data->common_dev_data_lock, irq_flags);
+               trace_printk("%s: overflow detected during IOMMU\n",
+                       __func__);
+               /* Don't treat the Overflow + Page fault scenario as fatal.
+                * Instead try to do a recovery. Using an existing event as
+                * as opposed to creating a new event.
+                */
+               msm_isp_halt_send_error(vfe_dev, ISP_EVENT_PING_PONG_MISMATCH);
+       } else {
+               spin_unlock_irqrestore(
+                       &vfe_dev->common_data->common_dev_data_lock, irq_flags);
+               trace_printk("%s:%d] VFE%d Handle Page fault! vfe_dev %pK\n",
+                       __func__, __LINE__,  vfe_dev->pdev->id, vfe_dev);
+               vfe_dev->hw_info->vfe_ops.axi_ops.halt(vfe_dev, 0);
+               msm_isp_halt_send_error(vfe_dev, ISP_EVENT_IOMMU_P_FAULT);
+       }
 
 	if (vfe_dev->buf_mgr->pagefault_debug_disable == 0) {
 		vfe_dev->buf_mgr->pagefault_debug_disable = 1;
@@ -1791,6 +1822,7 @@ void msm_isp_process_overflow_irq(
 	uint32_t force_overflow)
 {
 	uint32_t overflow_mask;
+    unsigned long flags;
 
 	/* if there are no active streams - do not start recovery */
 	if (!vfe_dev->axi_data.num_active_stream)
@@ -1817,15 +1849,21 @@ void msm_isp_process_overflow_irq(
 	if (overflow_mask) {
 		struct msm_isp_event_data error_event;
 
+        spin_lock_irqsave(
+			&vfe_dev->common_data->common_dev_data_lock, flags);
+
 		if (vfe_dev->reset_pending == 1) {
-			pr_err("%s:%d failed: overflow %x during reset\n",
+			trace_printk("%s:%d failed: overflow %x during reset\n",
 				__func__, __LINE__, overflow_mask);
 			/* Clear overflow bits since reset is pending */
 			*irq_status1 &= ~overflow_mask;
+            spin_unlock_irqrestore(
+				 &vfe_dev->common_data->common_dev_data_lock,
+				 flags);
 			return;
 		}
 
-		ISP_DBG("%s: VFE%d Bus overflow detected: start recovery!\n",
+		trace_printk("%s: VFE%d Bus overflow detected: start recovery!\n",
 			__func__, vfe_dev->pdev->id);
 
 		/* maks off irq for current vfe */
@@ -1836,6 +1874,8 @@ void msm_isp_process_overflow_irq(
 
 		vfe_dev->hw_info->vfe_ops.core_ops.
 			set_halt_restart_mask(vfe_dev);
+
+		vfe_dev->hw_info->vfe_ops.axi_ops.halt(vfe_dev, 0);
 
 		/* mask off other vfe if dual vfe is used */
 		if (vfe_dev->is_split) {
@@ -1861,6 +1901,10 @@ void msm_isp_process_overflow_irq(
 			vfe_dev->hw_info->vfe_ops.core_ops.
 				set_halt_restart_mask(vfe_dev->common_data->
 				dual_vfe_res->vfe_dev[other_vfe_id]);
+				if (other_vfe_dev) {
+	               	other_vfe_dev->hw_info->vfe_ops.axi_ops.
+    	           	halt(other_vfe_dev, 0);
+                }
 		}
 
 		/* reset irq status so skip further process */
@@ -1878,6 +1922,9 @@ void msm_isp_process_overflow_irq(
 			msm_isp_send_event(vfe_dev,
 				ISP_EVENT_ERROR, &error_event);
 		}
+        spin_unlock_irqrestore(
+			&vfe_dev->common_data->common_dev_data_lock,
+			flags);
 	}
 }
 
@@ -1998,7 +2045,7 @@ void msm_isp_do_tasklet(unsigned long data)
 		pingpong_status = queue_cmd->vfePingPongStatus;
 		ts = queue_cmd->ts;
 		spin_unlock_irqrestore(&vfe_dev->tasklet_lock, flags);
-		ISP_DBG("%s: vfe_id %d status0: 0x%x status1: 0x%x\n",
+		trace_printk("%s: vfe_id %d status0: 0x%x status1: 0x%x\n",
 			__func__, vfe_dev->pdev->id, irq_status0, irq_status1);
 		irq_ops->process_reset_irq(vfe_dev,
 			irq_status0, irq_status1);
@@ -2056,11 +2103,11 @@ static void msm_vfe_iommu_fault_handler(struct iommu_domain *domain,
 
 		mutex_lock(&vfe_dev->core_mutex);
 		if (vfe_dev->vfe_open_cnt > 0) {
-			atomic_set(&vfe_dev->error_info.overflow_state,
-				HALT_ENFORCED);
+			trace_printk("%s: fault address is %lx, HALT_ENFORCED\n",
+				__func__, iova);
 			msm_isp_process_iommu_page_fault(vfe_dev);
 		} else {
-			pr_err("%s: no handling, vfe open cnt = %d\n",
+			trace_printk("%s: no handling, vfe open cnt = %d\n",
 				__func__, vfe_dev->vfe_open_cnt);
 		}
 		mutex_unlock(&vfe_dev->core_mutex);
@@ -2218,9 +2265,12 @@ int msm_isp_close_node(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 		vfe_dev->buf_mgr->iommu_hdl,
 		NULL, vfe_dev);
 
-	rc = vfe_dev->hw_info->vfe_ops.axi_ops.halt(vfe_dev, 1);
-	if (rc <= 0)
+	trace_printk("%s: VFE%d halt in close_node \n", __func__, vfe_dev->pdev->id);
+  	rc = vfe_dev->hw_info->vfe_ops.axi_ops.halt(vfe_dev, 1);
+	if (rc <= 0) {
+		trace_printk("%s: halt timeout rc=%ld\n", __func__, rc);
 		pr_err("%s: halt timeout rc=%ld\n", __func__, rc);
+	}
 
 	vfe_dev->hw_info->vfe_ops.core_ops.
 		update_camif_state(vfe_dev, DISABLE_CAMIF_IMMEDIATELY);

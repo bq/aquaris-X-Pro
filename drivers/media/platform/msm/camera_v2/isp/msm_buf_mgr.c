@@ -741,13 +741,13 @@ static int msm_isp_update_put_buf_cnt(struct msm_isp_buf_mgr *buf_mgr,
 	if (!bufq) {
 		pr_err("Invalid bufq\n");
 		return rc;
-	}
+        }
 
 	spin_lock_irqsave(&bufq->bufq_lock, flags);
 	rc = msm_isp_update_put_buf_cnt_unsafe(buf_mgr, id, bufq_handle,
 		buf_index, tv, frame_id, pingpong_bit);
 	if (-ENOTEMPTY == rc) {
-		pr_err("%s: Error! Uncleared put_buf_mask for pingpong(%d) from vfe %d bufq 0x%x buf_idx %d\n",
+		trace_printk("%s: Error! Uncleared put_buf_mask for pingpong(%d) from vfe %d bufq 0x%x buf_idx %d\n",
 			__func__, pingpong_bit, id, bufq_handle, buf_index);
 		rc = -EFAULT;
 	}
@@ -872,6 +872,11 @@ static int msm_isp_flush_buf(struct msm_isp_buf_mgr *buf_mgr, uint32_t id,
 		}
 	}
 
+	if (flush_type == MSM_ISP_BUFFER_FLUSH_ALL) { 
+		for (i= 0; i < ISP_NUM_BUF_MASK; i++) { 
+			bufq->put_buf_mask[i] = 0; 
+		} 
+	} 
 	spin_unlock_irqrestore(&bufq->bufq_lock, flags);
 	return 0;
 }

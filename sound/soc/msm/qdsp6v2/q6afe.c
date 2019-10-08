@@ -1,8 +1,4 @@
-<<<<<<< HEAD
 /* Copyright (c) 2012-2017, 2019 The Linux Foundation. All rights reserved.
-=======
-/* Copyright (c) 2012-2019, The Linux Foundation. All rights reserved.
->>>>>>> LA.UM.6.6.r1-11300-89xx.0
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
